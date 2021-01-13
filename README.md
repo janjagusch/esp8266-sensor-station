@@ -13,4 +13,4 @@ Currently supported sensors are:
 
 ## Getting Started
 
-In `./lib` create two header files `wifi_secrets.h` and `mqtt_secrets.h` and fill out the definitions.
+In `./lib` create two header files `wifi_secrets.h` and `mqtt_secrets.h` and fill out the definitions. Adjust `sensor_station.h`, if necessary.
