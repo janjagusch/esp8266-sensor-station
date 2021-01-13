@@ -4,8 +4,7 @@ This script represents a sensor station with three sensors attached:
   * TSL2561 for luminosity,
   * CCS811 for eCO2 and TVOC
 
-Instructions to read sensor data are received through MQTT topics and
-reading results are also published through MQTT topics.
+The station reads the sensor data in regular interval and publishes them to MQTT topics.
 
 Run this script on a ESP8266 board.
 */
