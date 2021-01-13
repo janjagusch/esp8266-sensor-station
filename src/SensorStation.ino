@@ -15,87 +15,50 @@ Run this script on a ESP8266 board.
 #include "DHT.h"
 #include <Adafruit_Sensor.h>
 #include <Adafruit_TSL2561_U.h>
+#define ARDUINOJSON_USE_LONG_LONG 1
 #include <ArduinoJson.h>
+#include <NTPClient.h>
 #include <tuple>
+#include <WiFiUdp.h>
 #include <string>
 using namespace std;
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include "wifi_secrets.h"
+#include "mqtt_secrets.h"
+#include "sensor_station.h"
 
-/*
-  The CCS811 is an ultra-low power digital gas sensor solution which integrates a metal oxide (MOX) gas sensor
-  to detect a wide range of Volatile Organic Compounds (VOCs) for indoor air quality monitoring with a
-  microcontroller unit (MCU), which includes an Analog-to-Digital converter (ADC), and an I²C interface.
+const long utcOffsetInSeconds = 3600;
 
-  Wiring for ESP8266 NodeMCU boards:
-    * VCC to 3V3,
-    * GND to GND,
-    * SDA to D2,
-    * SCL to D1,
-    * nWAKE to GND
-*/
-#define CCS811_MODE CCS811_MODE_1SEC
-// #define CCS811_MODE CCS811_MODE_10SEC
-// #define CCS811_MODE CCS811_MODE_60SEC
-// #define CCS811_MODE CCS811_MODE_IDLE
-
-#define CCS811_SLAVE_ADDR CCS811_SLAVEADDR_0
-// #define CCS811_SLAVE_ADDR CCS811_SLAVEADDR_1
-
-// Pin number connected to nWAKE (nWAKE can also be bound to GND, then pass -1)
-#define CCS811_NWAKE_PIN -1
-
-/*
-  The DHT22 is a basic, low-cost digital temperature and humidity sensor.
-  It uses a capacitive humidity sensor and a thermistor to measure the surrounding air,
-  and spits out a digital signal on the data pin.
-  It's fairly simple to use, but requires careful timing to grab data.
-  The only real downside of this sensor is you can only get new data from it once every 2 seconds,
-  so when using our library, sensor readings can be up to 2 seconds old.
-
-  Wiring for ESP8266 NodeMCU boards:
-    * VCC to 3V3
-    * PIN 2 to whatever your DHT22_DATA_PIN is (default: D4)
-    * Connect a 10k resistor from PIN 2 to VCC
-    * GND to GND
-*/
-#define DHT22_DATA_PIN 2
-
-#define DHT22_TEMPERATURE_UNIT_FAHRENHEIT false // Otherwise Celsius
-// #define DHT22_TEMPERATURE_UNIT_FAHRENHEIT false
-
-#define DHT_TYPE DHT22
-
-/*
-The TSL2561 luminosity sensor is an advanced digital light sensor, ideal for use in a wide range of light situations.
-Compared to low cost CdS cells, this sensor is more precise, allowing for exact lux calculations and can be configured
-for different gain/timing ranges to detect light ranges from up to 0.1 - 40,000+ Lux on the fly.
-The best part of this sensor is that it contains both infrared and full spectrum diodes! That means you can separately measure infrared,
-full-spectrum or human-visible light.
-
-Wiring for ESP8266 NodeMCU boards:
-  * Connect VCC to 3.3V
-  * Connect GND to GND
-  * Connect SCL to SCL
-  * Connect SDA to SDA
-*/
-#define TSL2561_GAIN_AUTO true
-// #define TSL2561_GAIN_AUTO false
-
-#define TSL2561_GAIN TSL2561_GAIN_1X
-// #define TSL2561_GAIN TSL2561_GAIN_16X
-
-#define TSL2561_INTEGRATIONTIME TSL2561_INTEGRATIONTIME_13MS
-// #define TSL2561_INTEGRATIONTIME TSL2561_INTEGRATIONTIME_101MS
-// #define TSL2561_INTEGRATIONTIME TSL2561_INTEGRATIONTIME_402MS
-
-#define TSL2561_ADDR TSL2561_ADDR_FLOAT
-// #define TSL2561_ADDR TSL2561_ADDR_LOW
-// #define TSL2561_ADDR TSL2561_ADDR_HIGH
-
-#define TSL2561_SENSOR_ID -1
+std::string MQTT_CLIENT_PREFIX = "sensor_station_";
+std::string STATION_ID_STR = STATION_ID;
+std::string MQTT_CLIENT_ID_STR = MQTT_CLIENT_PREFIX + STATION_ID_STR;
+char *MQTT_CLIENT_ID = &MQTT_CLIENT_ID_STR[0];
 
 CCS811 ccs(CCS811_NWAKE_PIN, CCS811_SLAVE_ADDR);
 DHT dht(DHT22_DATA_PIN, DHT_TYPE);
 Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR, TSL2561_SENSOR_ID);
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+
+void setup_wifi()
+{
+  WiFi.begin(WIFI_SSID, WIFI_PSK);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(100);
+  }
+  Serial.println(WiFi.localIP());
+}
+
+void setup_mqtt()
+{
+  client.setServer(MQTT_BROKER, 1883);
+}
 
 void setup_ccs811()
 {
@@ -145,20 +108,24 @@ void setup()
   setup_ccs811();
   setup_dht22();
   setup_tsl2561();
+  setup_wifi();
+  setup_mqtt();
 }
 
-DynamicJsonDocument buildDocument(char *sensor, char *measure, char *unit, float value, char *error)
+DynamicJsonDocument buildDocument(char *sensor, char *measure, char *unit, float value, char *error, unsigned long timestamp)
 {
   DynamicJsonDocument doc(1024);
   doc["sensor"] = sensor;
-  doc["measure"] = measure;
+  doc["measurement"] = measure;
   doc["unit"] = unit;
   doc["value"] = value;
   doc["error"] = error;
+  doc["station"] = STATION_ID;
+  doc["timestamp"] = timestamp;
   return doc;
 }
 
-DynamicJsonDocument readHumidity()
+DynamicJsonDocument readHumidity(unsigned long timestamp)
 {
   float value = dht.readHumidity();
   char *error = (char *)"";
@@ -166,10 +133,10 @@ DynamicJsonDocument readHumidity()
   {
     error = (char *)"Error";
   }
-  return buildDocument((char *)"dht22", (char *)"humidity", (char *)"%", value, error);
+  return buildDocument((char *)"dht22", (char *)"humidity", (char *)"%", value, error, timestamp);
 }
 
-DynamicJsonDocument readTemperature()
+DynamicJsonDocument readTemperature(unsigned long timestamp)
 {
   float value = dht.readTemperature(DHT22_TEMPERATURE_UNIT_FAHRENHEIT);
   char *error = (char *)"";
@@ -182,7 +149,7 @@ DynamicJsonDocument readTemperature()
   {
     error = (char *)"Error";
   }
-  return buildDocument((char *)"dht22", (char *)"temperature", unit, value, error);
+  return buildDocument((char *)"dht22", (char *)"temperature", unit, value, error, timestamp);
 }
 
 uint16_t humidity_to_compensation(float humidity)
@@ -203,14 +170,14 @@ uint16_t temperature_to_compensation(float temperature)
   return uint16((temperature + 25) * 512);
 }
 
-DynamicJsonDocument buildECO2Document(float value, char *error)
+DynamicJsonDocument buildECO2Document(float value, char *error, unsigned long timestamp)
 {
-  return buildDocument((char *)"ccs811", (char *)"eco2", (char *)"ppm", value, error);
+  return buildDocument((char *)"ccs811", (char *)"eco2", (char *)"ppm", value, error, timestamp);
 }
 
-DynamicJsonDocument buildTVOCDocument(float value, char *error)
+DynamicJsonDocument buildTVOCDocument(float value, char *error, unsigned long timestamp)
 {
-  return buildDocument((char *)"ccs811", (char *)"tvoc", (char *)"ppb", value, error);
+  return buildDocument((char *)"ccs811", (char *)"tvoc", (char *)"ppb", value, error, timestamp);
 }
 
 void compensate_for_environment()
@@ -247,24 +214,24 @@ tuple<float, float, char *> readCCS811()
   return make_tuple(eco2, tvoc, error);
 }
 
-DynamicJsonDocument readECO2()
+DynamicJsonDocument readECO2(unsigned long timestamp)
 {
   tuple<float, float, char *> eco2_tvoc_error = readCCS811();
-  return buildECO2Document(get<0>(eco2_tvoc_error), get<2>(eco2_tvoc_error));
+  return buildECO2Document(get<0>(eco2_tvoc_error), get<2>(eco2_tvoc_error), timestamp);
 }
 
-DynamicJsonDocument readTVOC()
+DynamicJsonDocument readTVOC(unsigned long timestamp)
 {
   tuple<float, float, char *> eco2_tvoc_error = readCCS811();
-  return buildTVOCDocument(get<1>(eco2_tvoc_error), get<2>(eco2_tvoc_error));
+  return buildTVOCDocument(get<1>(eco2_tvoc_error), get<2>(eco2_tvoc_error), timestamp);
 }
 
-tuple<DynamicJsonDocument, DynamicJsonDocument> readECO2AndTVOC()
+tuple<DynamicJsonDocument, DynamicJsonDocument> readECO2AndTVOC(unsigned long timestamp)
 {
   tuple<float, float, char *> eco2_tvoc_error = readCCS811();
   return make_tuple(
-      buildECO2Document(get<0>(eco2_tvoc_error), get<2>(eco2_tvoc_error)),
-      buildTVOCDocument(get<1>(eco2_tvoc_error), get<2>(eco2_tvoc_error)));
+      buildECO2Document(get<0>(eco2_tvoc_error), get<2>(eco2_tvoc_error), timestamp),
+      buildTVOCDocument(get<1>(eco2_tvoc_error), get<2>(eco2_tvoc_error), timestamp));
 }
 
 tuple<float, char *> readTSL2561()
@@ -279,28 +246,49 @@ tuple<float, char *> readTSL2561()
   return make_tuple(event.light, error);
 }
 
-DynamicJsonDocument readLuminosity()
+DynamicJsonDocument readLuminosity(unsigned long timestamp)
 {
   tuple<float, char *> luminosity_error = readTSL2561();
-  return buildDocument((char *)"tsl2561", (char *)"luminosity", (char *)"lux", get<0>(luminosity_error), get<1>(luminosity_error));
+  return buildDocument((char *)"tsl2561", (char *)"luminosity", (char *)"lux", get<0>(luminosity_error), get<1>(luminosity_error), timestamp);
+}
+
+void publishDocument(DynamicJsonDocument doc, string topic)
+{
+  // Append STATION_ID to topic
+  topic += "/" + STATION_ID_STR;
+  char *topic_arr = &topic[0];
+  // Build payload
+  char payload[256];
+  serializeJson(doc, payload);
+  // Publish
+  client.publish(topic_arr, payload);
+}
+
+void mqtt_connect()
+{
+  if (!client.connected())
+  {
+    while (!client.connected())
+    {
+      client.connect(MQTT_CLIENT_ID);
+      delay(100);
+    }
+  }
 }
 
 void loop()
 {
-  tuple<DynamicJsonDocument, DynamicJsonDocument> docs = readECO2AndTVOC();
-  DynamicJsonDocument doc_temp = readTemperature();
-  DynamicJsonDocument doc_hum = readHumidity();
-  DynamicJsonDocument doc_luminosity = readLuminosity();
-  char buf[256];
-  serializeJson(get<0>(docs), buf);
-  Serial.println(buf);
-  serializeJson(get<1>(docs), buf);
-  Serial.println(buf);
-  serializeJson(doc_temp, buf);
-  Serial.println(buf);
-  serializeJson(doc_hum, buf);
-  Serial.println(buf);
-  serializeJson(doc_luminosity, buf);
-  Serial.println(buf);
-  delay(1000);
+  mqtt_connect();
+  timeClient.update();
+  unsigned long timestamp = timeClient.getEpochTime();
+  tuple<DynamicJsonDocument, DynamicJsonDocument> docs_eco2_tvoc = readECO2AndTVOC(timestamp);
+  DynamicJsonDocument doc_temperature = readTemperature(timestamp);
+  DynamicJsonDocument doc_humidity = readHumidity(timestamp);
+  DynamicJsonDocument doc_luminosity = readLuminosity(timestamp);
+  publishDocument(doc_luminosity, (char *)"apartment/sensors/response/tsl2561/luminosity");
+  publishDocument(doc_humidity, (char *)"apartment/sensors/response/dht22/humidity");
+  publishDocument(doc_temperature, (char *)"apartment/sensors/response/dht22/temperature");
+  publishDocument(get<0>(docs_eco2_tvoc), (char *)"apartment/sensors/response/ccs811/eco2");
+  publishDocument(get<1>(docs_eco2_tvoc), (char *)"apartment/sensors/response/ccs811/tvoc");
+  delay(STATION_READ_INTERVAL);
 }
